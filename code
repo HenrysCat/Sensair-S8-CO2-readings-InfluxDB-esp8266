@@ -1,0 +1,125 @@
+#include <ESP8266WiFiMulti.h>
+#include <Arduino.h>
+#include <InfluxDbClient.h>
+#include <InfluxDbCloud.h>
+#include <s8_uart.h>
+
+ESP8266WiFiMulti wifiMulti;
+
+// WiFi Device name
+#define DEVICE "SenseairS8"
+// WiFi AP SSID
+#define WIFI_SSID "Wifi_SSID"
+// WiFi password
+#define WIFI_PASSWORD "Wifi_password"
+// InfluxDB v2 server url, e.g. https://eu-central-1-1.aws.cloud2.influxdata.com (Use: InfluxDB UI -> Load Data -> Client Libraries)
+#define INFLUXDB_URL "http://your-influxdb-ip:8086"
+// InfluxDB v2 server or cloud API token (Use: InfluxDB UI -> Data -> API Tokens -> Generate API Token)
+#define INFLUXDB_TOKEN "your-influxdb_token"
+// InfluxDB v2 organization id (Use: InfluxDB UI -> User -> About -> Common Ids )
+#define INFLUXDB_ORG "your-influxdb-org"
+// InfluxDB v2 bucket name (Use: InfluxDB UI ->  Data -> Buckets)
+#define INFLUXDB_BUCKET "your-influxdb-bucket"
+
+#define TZ_INFO "GMT+0BST-1,M3.5.0/01:00:00,M10.5.0/02:00:00"
+
+// InfluxDB client instance with preconfigured InfluxCloud certificate
+InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN, InfluxDbCloud2CACert);
+
+// Data point
+Point sensor_db("CO2");
+
+#define S8_RX_PIN 13         // Rx pin which the S8 Tx pin is attached to (change if it is needed)
+#define S8_TX_PIN 15         // Tx pin which the S8 Rx pin is attached to (change if it is needed)
+#define S8_BAUDRATE 9600    // Baudrate of the S8 UART interface (default is 9600) (change if it is needed)
+
+SoftwareSerial S8_serial(S8_RX_PIN, S8_TX_PIN); // RX, TX
+
+S8_UART *sensor_S8_uart;
+S8_sensor sensor_s8;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup wifi
+  WiFi.mode(WIFI_STA);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to wifi");
+  while (wifiMulti.run() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(100);
+  }
+  Serial.println();
+
+  // Add tags
+  sensor_db.addTag("device", DEVICE + String("_CO2"));
+  sensor_db.addTag("sensor_type", "SenseAir S8");
+
+  // Check server connection
+  if (client.validateConnection()) {
+    Serial.print("Connected to InfluxDB: ");
+    Serial.println(client.getServerUrl());
+  } else {
+    Serial.print("InfluxDB connection failed: ");
+    Serial.println(client.getLastErrorMessage());
+  }
+
+  // First message, we are alive
+  Serial.println("");
+  Serial.println("Init");
+
+  // Initialize S8 sensor
+  S8_serial.begin(S8_BAUDRATE);
+  sensor_S8_uart = new S8_UART(S8_serial);
+
+  // Check if S8 is available
+  sensor_S8_uart->get_firmware_version(sensor_s8.firm_version);
+  int len = strlen(sensor_s8.firm_version);
+  if (len == 0) {
+      Serial.println("SenseAir S8 CO2 sensor not found!");
+      while (1) { delay(1); };
+  }
+
+  // Show basic S8 sensor info
+  Serial.println(">>> SenseAir S8 NDIR CO2 sensor <<<");
+  printf("Firmware version: %s\n", sensor_s8.firm_version);
+  sensor_s8.sensor_id = sensor_S8_uart->get_sensor_ID();
+  
+  Serial.print("Sensor ID: 0x");
+  printIntToHex(sensor_s8.sensor_id, 4);
+  Serial.println("");
+
+  Serial.println("Setup done!");
+  Serial.flush();
+}
+
+void loop() {
+  // Clear fields for reusing the point. Tags will remain untouched
+  sensor_db.clearFields();
+
+   // Get CO2 measure
+  sensor_s8.co2 = sensor_S8_uart->get_co2();
+
+  // Store measured value into point
+  // Report RSSI of currently connected network
+  sensor_db.addField("co2_value", sensor_s8.co2 + 20);
+
+  // Print what are we exactly writing
+  Serial.print("Writing: ");
+  Serial.println(sensor_db.toLineProtocol());
+
+  // Check WiFi connection and reconnect if needed
+  if (wifiMulti.run() != WL_CONNECTED) {
+    Serial.println("Wifi connection lost");
+  }
+
+  // Write point
+  if (!client.writePoint(sensor_db)) {
+    Serial.print("InfluxDB write failed: ");
+    Serial.println(client.getLastErrorMessage());
+  }
+
+  Serial.println("Wait 60s");
+  delay(60000);
+}
